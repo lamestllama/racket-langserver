@@ -6,8 +6,9 @@
          update-configuration
          fetch-configuration
          client-capability-workspace/configuration?)
-(require compiler/module-suffix
-         json
+(require json
+         net/url
+         racket/list
          racket/match)
 (require "../common/json-util.rkt"
          "../common/path-util.rkt"
@@ -15,7 +16,6 @@
          "lsp.rkt"
          "safedoc.rkt"
          "../doclib/doc.rkt"
-         "scheduler.rkt"
          "../common/settings.rkt"
          "../workspace/current.rkt"
          "../workspace/state.rkt")
@@ -23,35 +23,22 @@
 (define (republish-open-doc-contributions!)
   (lsp-for-each-open-doc
     (lambda (safe-doc)
-      (define contribution
-        (with-read-doc safe-doc
-          (lambda (doc)
-            (Doc-contribution doc))))
-      (when contribution
-        (workspace-set-contribution! current-workspace contribution)))))
+      (with-read-doc safe-doc
+        (lambda (doc)
+          (define contribution (Doc-contribution doc))
+          (when contribution
+            (workspace-set-contribution! current-workspace contribution)))))))
 
 (define (didRenameFiles params)
   (match-define (^RenameFilesParams #:files files) params)
-  (for ([f files])
-    (match-define (FileRename #:oldUri old-uri #:newUri new-uri) f)
-    (workspace-remove-path! current-workspace (uri->path old-uri))
-
-    ; remove all awaiting internal queries about `old-uri`
-    (define safe-doc (lsp-get-doc old-uri #f))
-
-
-    ; `safe-doc = #f` should be rarely happened.
-    ; we simply give up to handle it, let's trust LSP client will send
-    ; other request about analysis this file.
-    (when safe-doc
-      (lsp-close-doc! old-uri))
-
-    (when (and safe-doc (regexp-match (get-module-suffix-regexp) new-uri))
-      (define-values (old-text old-version)
-        (with-read-doc safe-doc
-          (lambda (doc)
-            (values (doc-get-text doc) (Doc-version doc)))))
-      (lsp-open-doc! new-uri old-text old-version))))
+  ;; File operations invalidate both disk paths. Client textDocument
+  ;; notifications own buffer lifetimes and schedule analysis on didOpen.
+  (invalidate-file-uris!
+    (append-map
+      (lambda (file)
+        (match-define (FileRename #:oldUri old-uri #:newUri new-uri) file)
+        (list old-uri new-uri))
+      files)))
 
 (define (didChangeWorkspaceFolders params)
   (match-define (^DidChangeWorkspaceFoldersParams #:event event) params)
@@ -67,28 +54,21 @@
 
 (define (didChangeWatchedFiles params)
   (match-define (^DidChangeWatchedFilesParams #:changes changes) params)
-  (for ([change changes])
-    (match-define (FileEvent #:uri uri #:type type) change)
-    (match (FileChangeType-v type)
-      ['created (handle-file-created uri)]
-      ['changed (handle-file-changed uri)]
-      ['deleted (handle-file-deleted uri)]
-      [_ (eprintf "Invalid file event type: ~a~n" type)])))
+  (invalidate-file-uris!
+    (for/list ([change changes])
+      (match-define (FileEvent #:uri uri #:type _) change)
+      uri)))
 
-(define (handle-file-created uri)
-  (when (regexp-match (get-module-suffix-regexp) uri)
-    (lsp-open-doc! uri "" 0)))
-
-(define (handle-file-changed uri)
-  (when (regexp-match (get-module-suffix-regexp) uri)
-    (let ([safe-doc (lsp-get-doc uri #f)])
-      (when safe-doc
-        (clear-old-queries/doc-close (SafeDoc-token safe-doc))))))
-
-(define (handle-file-deleted uri)
-  (workspace-remove-path! current-workspace (uri->path uri))
-  (when (regexp-match (get-module-suffix-regexp) uri)
-    (lsp-close-doc! uri)))
+(define (invalidate-file-uris! uris)
+  ;; Decode the entire batch before changing any cached or open document state.
+  (define paths
+    (for/list ([uri (in-list uris)])
+      (define url (string->url uri))
+      (and (equal? (url-scheme url) "file") (url->path url))))
+  (for ([path paths] #:when path)
+    ;; A disk event invalidates cached facts, never the client's buffer.
+    ;; Fresh closed-file analysis can be added separately.
+    (lsp-invalidate-path! path)))
 
 (define (apply-langserver-settings settings)
   (match-define (Langserver-Settings #:resyntax resyntax #:formatting formatting)
@@ -155,4 +135,3 @@
     [(hash-table ['racket-langserver langserver-settings])
      (update-configuration langserver-settings)]
     [_ (fetch-configuration request-client)]))
-
